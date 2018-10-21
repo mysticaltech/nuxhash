@@ -20,8 +20,8 @@ class TestExcavator(unittest.TestCase):
         self.settings['nicehash']['wallet'] = '3Qe7nT9hBSVoXr8rM2TG6pq82AmLVKHy23'
         self.device = devices[0]
 
-        self.excavator = Excavator(self.configdir,
-                                   nuxhash.settings.DEFAULT_SETTINGS)
+        self.excavator = Excavator(self.configdir)
+        self.excavator.settings = nuxhash.settings.DEFAULT_SETTINGS
         self.equihash = next(a for a in self.excavator.algorithms
                              if a.algorithms == ['equihash'])
         self.neoscrypt = next(a for a in self.excavator.algorithms
@@ -109,12 +109,12 @@ class TestExcavator(unittest.TestCase):
     def test_benchmark_mode(self):
         self.equihash.set_devices([self.device])
         sleep(1)
-        self.equihash.set_benchmarking(True)
+        self.equihash.benchmarking = True
         self.assertEqual(self._get_workers(), [{ 'device_uuid': self.device.uuid,
                                                  'algorithms': ['equihash'] }])
 
     def test_benchmark_stop(self):
-        self.equihash.set_benchmarking(True)
+        self.equihash.benchmarking = True
         self.equihash.set_devices([self.device])
         sleep(1)
         self.equihash.set_devices([])

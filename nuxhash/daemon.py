@@ -7,22 +7,28 @@ import signal
 import socket
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from random import random
 from ssl import SSLError
 from threading import Event
 from urllib.error import URLError
 
 from nuxhash import nicehash, settings, utils
+from nuxhash.bitcoin import check_bc
 from nuxhash.devices.nvidia import enumerate_devices as nvidia_devices
 from nuxhash.devices.nvidia import NvidiaDevice
 from nuxhash.download.downloads import make_miners
-from nuxhash.miners.excavator import Excavator
+from nuxhash.miners import all_miners
 from nuxhash.miners.miner import MinerNotRunning
 from nuxhash.switching.naive import NaiveSwitcher
+from nuxhash.version import __version__
 
 
 BENCHMARK_SECS = 60
+DONATE_PROB = 0.005
+DONATE_ADDRESS = '3Qe7nT9hBSVoXr8rM2TG6pq82AmLVKHy23'
 
 
 def main():
@@ -45,8 +51,14 @@ def main():
         '-c', '--configdir', nargs=1, default=[settings.DEFAULT_CONFIGDIR],
         help=('directory for configuration and benchmark files'
               + ' (default: ~/.config/nuxhash/)'))
+    argp.add_argument('--version', action='store_true',
+                      help='show nuxhash version')
     args = argp.parse_args()
     config_dir = Path(args.configdir[0])
+
+    if args.version:
+        print('nuxhash daemon %s' % __version__)
+        return
 
     if args.show_mining:
         log_level = logging.DEBUG
@@ -74,7 +86,9 @@ def main():
         if not d.verify():
             logging.info('Downloading %s' % d.name)
             d.download()
-    nx_miners = [Excavator(config_dir, nx_settings)]
+    nx_miners = [miner(config_dir) for miner in all_miners]
+    for miner in nx_miners:
+        miner.settings = nx_settings
 
     # Select code path(s), benchmarks and/or mining.
     if args.benchmark_all:
@@ -97,9 +111,19 @@ def main():
 
 def initial_setup():
     print('nuxhashd initial setup')
-    wallet = input('Wallet address: ')
+
+    wallet = ''
+    while not check_bc(wallet):
+        wallet = input('Wallet address: ')
+
     workername = input('Worker name: ')
-    region = input('Region (eu/usa/hk/jp/in/br): ')
+    if workername == '':
+        workername = 'nuxhash'
+
+    region = ''
+    while region not in ['eu', 'usa', 'hk', 'jp', 'in', 'br']:
+        region = input('Region (eu/usa/hk/jp/in/br): ')
+
     print()
     return wallet, workername, region
 
@@ -219,6 +243,7 @@ class MiningSession(object):
                 self._last_payrates = (payrates, datetime.now())
         for miner in self._miners:
             miner.stratums = stratums
+            miner.load()
         self._algorithms = sum([miner.algorithms for miner in self._miners], [])
 
         # Initialize profit-switching.
@@ -237,6 +262,8 @@ class MiningSession(object):
         self._quit_signal.set()
 
     def _switch_algos(self):
+        interval = self._settings['switching']['interval']
+
         # Get profitability information from NiceHash.
         try:
             payrates, stratums = nicehash.simplemultialgo_info(self._settings)
@@ -269,8 +296,23 @@ class MiningSession(object):
                             if algorithm == this_algorithm]
             this_algorithm.set_devices(this_devices)
 
-        self._scheduler.enter(self._settings['switching']['interval'],
-                              MiningSession.PROFIT_PRIORITY, self._switch_algos)
+        # Donation time.
+        if not self._settings['donate']['optout'] and random() < DONATE_PROB:
+            logging.warning('This interval will be donation time.')
+            donate_settings = deepcopy(self._settings)
+            donate_settings['nicehash']['wallet'] = DONATE_ADDRESS
+            donate_settings['nicehash']['workername'] = 'nuxhash'
+            for miner in self._miners:
+                miner.settings = donate_settings
+            self._scheduler.enter(interval, MiningSession.PROFIT_PRIORITY,
+                                  self._reset_miners)
+
+        self._scheduler.enter(interval, MiningSession.PROFIT_PRIORITY,
+                              self._switch_algos)
+
+    def _reset_miners(self):
+        for miner in self._miners:
+            miner.settings = self._settings
 
     def _watch_algos(self):
         running_algorithms = self._assignments.values()

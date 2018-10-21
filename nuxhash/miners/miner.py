@@ -24,15 +24,15 @@ class MinerNotResponding(MinerException):
 
 class Miner(object):
 
-    def __init__(self, config_dir, settings):
+    def __init__(self, config_dir):
         # list of runnable algorithms supplied by this miner
         self.algorithms = []
         # configuration directory, for accessing downloaded miners
         self.config_dir = config_dir
         # current state of settings
-        self.settings = settings
-        # dict of algorithm name -> nicehash stratum uri; set later
-        self.stratums = {}
+        self._settings = None
+        # dict of algorithm name -> nicehash stratum uri
+        self._stratums = {}
 
     def load(self):
         """Initialize the mining program if necessary (e.g. start a server)."""
@@ -42,13 +42,25 @@ class Miner(object):
         """Clean up after load()."""
         pass
 
-    def reload(self):
-        """Restart the miner in the event of an unusual condition (crash)."""
-        pass
-
     def is_running(self):
         """Probe if the miner is operational."""
         pass
+
+    @property
+    def settings(self):
+        return self._settings
+    @settings.setter
+    def settings(self, v):
+        """Change settings during runtime."""
+        self._settings = v
+
+    @property
+    def stratums(self):
+        return self._stratums
+    @stratums.setter
+    def stratums(self, v):
+        """Change pools during runtime."""
+        self._stratums = v
 
 
 class Algorithm(object):
@@ -63,7 +75,7 @@ class Algorithm(object):
         # warmup time for benchmarking purposes (either short or long)
         self.warmup_secs = warmup_secs
         # benchmarking mode
-        self.benchmarking = False
+        self._benchmarking = False
 
     def __repr__(self):
         return "<algorithm:%s %s>" % (self.name, self.algorithms)
@@ -76,9 +88,12 @@ class Algorithm(object):
         """Run this algorithm on the set of devices."""
         pass
 
-    def set_benchmarking(self, v):
-        """Engage/disengage benchmarking mode."""
-        self.benchmarking = v
+    @property
+    def benchmarking(self):
+        return self._benchmarking
+    @benchmarking.setter
+    def benchmarking(self, v):
+        self._benchmarking = v
 
     def current_speeds(self):
         pass
@@ -89,7 +104,7 @@ def needs_miner_running(method):
     @wraps(method)
     def wrapper(self, *args, **kwargs):
         if not self.parent.is_running():
-            self.parent.reload()
+            self.parent.load()
         return method(self, *args, **kwargs)
     return wrapper
 

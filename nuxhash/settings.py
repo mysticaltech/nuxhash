@@ -14,16 +14,18 @@ DEFAULT_SETTINGS = {
         'workername': 'nuxhash',
         'region': 'usa',
         },
-    'excavator': {
-        'enabled': True,
-        'port': 3456
-        },
     'switching': {
         'interval': 60,
         'threshold': 0.1
         },
     'gui': {
         'units': 'mBTC'
+        },
+    'donate': {
+        'optout': False
+        },
+    'excavator_miner': {
+        'listen': ''
         }
     }
 EMPTY_BENCHMARKS = defaultdict(lambda: {})
@@ -43,16 +45,18 @@ def read_settings_from_file(fd):
             'workername': get_option(parser.get, 'nicehash', 'workername'),
             'region': get_option(parser.get, 'nicehash', 'region')
             },
-        'excavator': {
-            'enabled': get_option(parser.getboolean, 'excavator', 'enabled'),
-            'port': get_option(parser.getint, 'excavator', 'port')
-            },
         'switching': {
             'interval': get_option(parser.getint, 'switching', 'interval'),
             'threshold': get_option(parser.getfloat, 'switching', 'threshold')
             },
         'gui': {
             'units': get_option(parser.get, 'gui', 'units')
+            },
+        'donate': {
+            'optout': get_option(parser.getboolean, 'donate', 'optout')
+            },
+        'excavator_miner': {
+            'listen': get_option(parser.get, 'excavator_miner', 'listen')
             }
         }
 

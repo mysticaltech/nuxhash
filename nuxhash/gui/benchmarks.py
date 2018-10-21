@@ -1,8 +1,10 @@
+import re
 import threading
 
 import wx
 import wx.dataview
-from wx.lib.newevent import NewEvent
+from wx.lib.newevent import NewCommandEvent
+from wx.lib.pubsub import pub
 from wx.lib.scrolledpanel import ScrolledPanel
 
 from nuxhash import utils
@@ -14,177 +16,233 @@ from nuxhash.settings import DEFAULT_SETTINGS
 
 BENCHMARK_SECS = 60
 
-StatusEvent, EVT_STATUS = NewEvent()
-SetEvent, EVT_SET_VALUE = NewEvent()
-DoneEvent, EVT_COMPLETE = NewEvent()
+InputSpeedsEvent, EVT_SPEEDS = NewCommandEvent()
 
 
 class BenchmarksScreen(wx.Panel):
 
-    def __init__(self, parent, *args, devices=[], frame=None, **kwargs):
+    def __init__(self, parent, *args, devices=[], **kwargs):
         wx.Panel.__init__(self, parent, *args, **kwargs)
-        self._devices = devices
-        self._frame = frame
+        self._Devices = devices
+        self._Settings = self._Benchmarks = None
+        self._Miners = [miner(main.CONFIG_DIR) for miner in all_miners]
         # dict of (device, algorithm) -> Item
-        self._items = {}
-        self._thread = None
-        self.Bind(main.EVT_SETTINGS, self.OnNewSettings)
-        self.Bind(main.EVT_BENCHMARKS, self.OnNewBenchmarks)
-        self.Bind(EVT_STATUS, self.OnBenchmarkStatus)
-        self.Bind(EVT_SET_VALUE, self.OnBenchmarkSet)
-        self.Bind(EVT_COMPLETE, self.OnBenchmarksComplete)
+        self._Items = {}
+        self._Thread = None
+
+        pub.subscribe(self._OnSettings, 'data.settings')
+        pub.subscribe(self._OnBenchmarks, 'data.benchmarks')
+
+        pub.subscribe(self._OnStartMining, 'mining.start')
+        pub.subscribe(self._OnStopMining, 'mining.stop')
+
+        pub.subscribe(self._OnClose, 'app.close')
+
+        pub.subscribe(self._OnBenchmarkStatus, 'benchmarking.status')
+        pub.subscribe(self._OnBenchmarkSet, 'benchmarking.set')
+        pub.subscribe(self._OnBenchmarkClear, 'benchmarking.clear')
+        pub.subscribe(self._OnBenchmarkStop, 'benchmarking.stop')
+
+        self.Bind(EVT_SPEEDS, self.OnInputSpeeds)
+
         sizer = wx.BoxSizer(orient=wx.VERTICAL)
         self.SetSizer(sizer)
 
         # Create inner scrolled area.
-        inner_window = ScrolledPanel(self)
-        inner_window.SetupScrolling()
-        sizer.Add(inner_window, wx.SizerFlags().Border(wx.LEFT|wx.RIGHT|wx.TOP,
-                                                       main.PADDING_PX)
-                                               .Proportion(1.0)
-                                               .Expand())
-        inner_sizer = wx.BoxSizer(orient=wx.VERTICAL)
-        inner_window.SetSizer(inner_sizer)
+        innerWindow = ScrolledPanel(self)
+        innerWindow.SetupScrolling()
+        sizer.Add(innerWindow, wx.SizerFlags().Border(wx.LEFT|wx.RIGHT|wx.TOP,
+                                                      main.PADDING_PX)
+                                              .Proportion(1.0)
+                                              .Expand())
+        innerSizer = wx.BoxSizer(orient=wx.VERTICAL)
+        innerWindow.SetSizer(innerSizer)
 
         # Populate it with a collapsible panel for each device.
-        self._device_pane = {}
-        for device in self._devices:
-            device_cp = wx.CollapsiblePane(
-                inner_window, label=('%s\n%s' % (device.name, device.uuid)))
+        self._DeviceCp = {}
+        for device in self._Devices:
+            deviceCp = wx.CollapsiblePane(
+                innerWindow, label=('%s\n%s' % (device.name, device.uuid)),
+                style=wx.CP_NO_TLW_RESIZE)
             self.Bind(wx.EVT_COLLAPSIBLEPANE_CHANGED, self.OnPaneChanged,
-                      device_cp)
-            inner_sizer.Add(device_cp, wx.SizerFlags().Expand())
-            self._device_pane[device] = device_cp.GetPane()
+                      deviceCp)
+            innerSizer.Add(deviceCp, wx.SizerFlags().Expand())
+            self._DeviceCp[device] = deviceCp
 
-        bottom_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
-        sizer.Add(bottom_sizer, wx.SizerFlags().Border(wx.ALL, main.PADDING_PX)
-                                               .Expand())
+        bottomSizer = wx.BoxSizer(orient=wx.HORIZONTAL)
+        sizer.Add(bottomSizer, wx.SizerFlags().Border(wx.ALL, main.PADDING_PX)
+                                              .Expand())
 
         # Create bottom controls.
-        self._select_todo = wx.Button(self, label='Unmeasured')
-        self.Bind(wx.EVT_BUTTON, self.OnSelectUnmeasured, self._select_todo)
-        bottom_sizer.Add(self._select_todo)
+        self._SelectTodo = wx.Button(self, label='Unmeasured')
+        self.Bind(wx.EVT_BUTTON, self.OnSelectUnmeasured, self._SelectTodo)
+        bottomSizer.Add(self._SelectTodo)
 
-        bottom_sizer.AddSpacer(main.PADDING_PX)
+        bottomSizer.AddSpacer(main.PADDING_PX)
 
-        self._select_none = wx.Button(self, label='None')
-        self.Bind(wx.EVT_BUTTON, self.OnSelectNone, self._select_none)
-        bottom_sizer.Add(self._select_none)
+        self._SelectNone = wx.Button(self, label='None')
+        self.Bind(wx.EVT_BUTTON, self.OnSelectNone, self._SelectNone)
+        bottomSizer.Add(self._SelectNone)
 
-        bottom_sizer.AddStretchSpacer()
+        bottomSizer.AddStretchSpacer()
 
-        bottom_sizer.AddSpacer(main.PADDING_PX)
-        self._benchmark = wx.Button(self, label='Benchmark')
-        self.Bind(wx.EVT_BUTTON, self.OnBenchmark, self._benchmark)
-        bottom_sizer.Add(self._benchmark)
+        self._Benchmark = wx.Button(self, label='Benchmark')
+        self.Bind(wx.EVT_BUTTON, self.OnBenchmark, self._Benchmark)
+        bottomSizer.Add(self._Benchmark)
 
-        self._repopulate()
+    def _OnSettings(self, settings):
+        if settings != self._Settings:
+            self._Settings = settings
+            for miner in self._Miners:
+                miner.settings = settings
+            if self._Benchmarks is not None:
+                self._Repopulate()
 
-    def OnNewSettings(self, event):
-        pass
+    def _OnBenchmarks(self, benchmarks):
+        if benchmarks != self._Benchmarks:
+            self._Benchmarks = benchmarks
+            self._Repopulate()
 
-    def OnNewBenchmarks(self, event):
-        pass
+    def _OnStartMining(self):
+        self._Benchmark.Disable()
 
-    def _repopulate(self):
-        self._miners = [miner(main.CONFIG_DIR, self._frame.settings)
-                        for miner in all_miners]
-        all_algorithms = sum([miner.algorithms for miner in self._miners], [])
-        self._items = {}
-        for device in self._devices:
-            pane = self._device_pane[device]
-            old_sizer = pane.GetSizer()
-            if old_sizer:
-                old_sizer.Clear(True)
+    def _OnStopMining(self):
+        self._Benchmark.Enable()
 
-            algorithms = [algorithm for algorithm in all_algorithms
+    def _OnClose(self):
+        if self._ThreadRunning():
+            self._Thread.stop()
+            self._Thread.join()
+
+    def _Repopulate(self):
+        allAlgorithms = sum([miner.algorithms for miner in self._Miners], [])
+        self._Items = {}
+        for device in self._Devices:
+            cp = self._DeviceCp[device]
+            pane = cp.GetPane()
+            oldSizer = pane.GetSizer()
+            if oldSizer:
+                oldSizer.Clear(True)
+
+            algorithms = [algorithm for algorithm in allAlgorithms
                           if algorithm.accepts(device)]
-            sizer = wx.FlexGridSizer(len(algorithms), 3, wx.Size(0, 0))
+            sizer = wx.FlexGridSizer(len(algorithms), 4, wx.Size(0, 0))
             pane.SetSizer(sizer, deleteOld=True)
-            sizer.AddGrowableCol(1)
+            sizer.AddGrowableCol(3)
             for algorithm in algorithms:
                 item = Item(pane, algorithm)
                 sizer.Add(item.checkbox)
-                sizer.Add(item.label)
-                sizer.Add(item.speeds)
-                self._items[(device, algorithm)] = item
-
-                benchmarks = self._frame.benchmarks[device]
-                if algorithm.name in benchmarks:
-                    item.speeds.set_values(benchmarks[algorithm.name])
+                sizer.Add(item.label, wx.SizerFlags().Expand())
+                sizer.AddSpacer(main.PADDING_PX)
+                sizer.Add(item.speeds, wx.SizerFlags().Expand())
+                self._Items[(device, algorithm)] = item
+                self._ResetSpeedCtrl(device, algorithm)
+            cp.Expand()
+        self._SelectUnmeasured()
         self.Layout()
 
+    def _SelectUnmeasured(self):
+        self._Selection = (
+            [(device, algorithm) for (device, algorithm) in self._Items.keys()
+             if algorithm.name not in self._Benchmarks[device]])
+
     def OnSelectUnmeasured(self, event):
-        self._set_selection(
-            [(device, algorithm) for (device, algorithm) in self._items.keys()
-             if algorithm.name not in self._frame.benchmarks[device]])
+        self._SelectUnmeasured()
 
     def OnSelectNone(self, event):
-        self._set_selection([])
+        self._Selection = []
 
     def OnBenchmark(self, event):
-        if not self._thread:
-            self._select_todo.Disable()
-            self._select_none.Disable()
-            for item in self._items.values():
+        selection = self._Selection
+        running = self._ThreadRunning()
+        if not running and len(selection) > 0:
+            self._SelectTodo.Disable()
+            self._SelectNone.Disable()
+            for item in self._Items.values():
                 item.checkbox.Disable()
-            self._benchmark.SetLabel('Cancel')
+            self._Benchmark.SetLabel('Cancel')
 
-            selection = self._get_selection()
-            self._thread = BenchmarkThread(
+            pub.sendMessage('benchmarking.start')
+
+            self._Thread = BenchmarkThread(
                 selection, window=self,
-                settings=self._frame.settings, miners=self._miners)
-            self._thread.start()
+                settings=self._Settings, miners=self._Miners)
+            self._Thread.start()
+        elif running:
+            self._Thread.stop()
+            self._Thread.join()
+
+    def _OnBenchmarkStatus(self, target, speeds, time, warmup=False):
+        item = self._Items[target]
+        if warmup:
+            item.speeds.SetWarmup(time)
         else:
-            self._thread.stop()
-            self._thread.join()
+            item.speeds.SetBenchmark(speeds, time)
 
-    def OnBenchmarkStatus(self, event):
-        item = self._items[event.target]
-        if event.warmup:
-            item.speeds.set_warmup(event.time)
-        else:
-            item.speeds.set_benchmark(event.speeds, event.time)
+    def _OnBenchmarkSet(self, target, speeds):
+        device, algorithm = target
+        self._Benchmarks[device][algorithm.name] = speeds
+        pub.sendMessage('data.benchmarks', benchmarks=self._Benchmarks)
+        self._ResetSpeedCtrl(device, algorithm)
 
-    def OnBenchmarkSet(self, event):
-        device, algorithm = event.target
-        self._frame.benchmarks[device][algorithm.name] = event.speeds
-        # We still need to activate the setter.
-        self._frame.benchmarks = self._frame.benchmarks
+    def _OnBenchmarkClear(self, target):
+        device, algorithm = target
+        if algorithm.name in self._Benchmarks[device]:
+            del self._Benchmarks[device][algorithm.name]
+        pub.sendMessage('data.benchmarks', benchmarks=self._Benchmarks)
+        self._ResetSpeedCtrl(device, algorithm)
 
-        item = self._items[event.target]
-        item.speeds.set_values(event.speeds)
+    def _OnBenchmarkStop(self):
+        self._Thread.join()
+        self._Thread = None
 
-    def OnBenchmarksComplete(self, event):
-        self._thread.join()
-        self._thread = None
-
-        self._select_todo.Enable()
-        self._select_none.Enable()
-        for (device, algorithm), item in self._items.items():
+        self._SelectTodo.Enable()
+        self._SelectNone.Enable()
+        for (device, algorithm), item in self._Items.items():
             item.checkbox.Enable()
             # Reset speed controls in case benchmarking was aborted.
-            benchmarks = self._frame.benchmarks[device]
-            if algorithm.name in benchmarks:
-                item.speeds.set_values(benchmarks[algorithm.name])
-            else:
-                item.speeds.set_values([0.0]*len(algorithm.algorithms))
-        self._benchmark.SetLabel('Benchmark')
+            self._ResetSpeedCtrl(device, algorithm)
+        self._Benchmark.SetLabel('Benchmark')
 
-    def _set_selection(self, selection):
-        for (device, algorithm) in self._items.keys():
-            item = self._items[(device, algorithm)]
+    def OnPaneChanged(self, event):
+        self.Layout()
+
+    def OnInputSpeeds(self, event):
+        source = event.GetEventObject()
+        target = next((device, algorithm) for ((device, algorithm), item)
+                      in self._Items.items() if item.speeds == source)
+        device, algorithm = target
+        nSpeeds = len(event.speeds)
+        nNeeded = len(algorithm.algorithms)
+        if nSpeeds >= nNeeded:
+            speeds = event.speeds[:nNeeded]
+            pub.sendMessage('benchmarking.set', target=target, speeds=speeds)
+        elif nSpeeds == 0:
+            pub.sendMessage('benchmarking.clear', target=target)
+        else:
+            self._ResetSpeedCtrl(device, algorithm)
+
+    def _ResetSpeedCtrl(self, device, algorithm):
+        item = self._Items[(device, algorithm)]
+        benchmarks = self._Benchmarks[device]
+        item.speeds.SetValues(
+            benchmarks.get(algorithm.name, [0.0]*len(algorithm.algorithms)))
+
+    def _ThreadRunning(self):
+        return self._Thread is not None
+
+    @property
+    def _Selection(self):
+        return [(device, algorithm) for ((device, algorithm), item)
+                in self._Items.items() if item.is_selected()]
+    @_Selection.setter
+    def _Selection(self, selection):
+        for (device, algorithm) in self._Items.keys():
+            item = self._Items[(device, algorithm)]
             if (device, algorithm) in selection:
                 item.select()
             else:
                 item.deselect()
-
-    def _get_selection(self):
-        return [(device, algorithm) for ((device, algorithm), item)
-                in self._items.items() if item.is_selected()]
-
-    def OnPaneChanged(self, event):
-        self.Layout()
 
 
 class BenchmarkThread(threading.Thread):
@@ -203,23 +261,23 @@ class BenchmarkThread(threading.Thread):
 
         for target in self._targets:
             def report(sample, secs_remaining):
-                wx.PostEvent(self._window,
-                             StatusEvent(target=target, speeds=sample,
-                                         time=abs(secs_remaining),
-                                         warmup=(secs_remaining < 0)))
+                main.sendMessage(
+                    self._window, 'benchmarking.status',
+                    target=target, speeds=sample, time=abs(secs_remaining),
+                    warmup=(secs_remaining < 0))
             device, algorithm = target
             speeds = utils.run_benchmark(
                 algorithm, device, algorithm.warmup_secs, BENCHMARK_SECS,
                 sample_callback=report, abort_signal=self._abort)
             if self._abort.is_set():
                 break
-
-            wx.PostEvent(self._window, SetEvent(target=target, speeds=speeds))
+            main.sendMessage(self._window, 'benchmarking.set',
+                             target=target, speeds=speeds)
 
         for miner in self._miners:
             miner.unload()
 
-        wx.PostEvent(self._window, DoneEvent())
+        main.sendMessage(self._window, 'benchmarking.stop')
 
     def stop(self):
         self._abort.set()
@@ -230,8 +288,11 @@ class Item(object):
     def __init__(self, parent, algorithm):
         self.checkbox = wx.CheckBox(parent)
         self.label = wx.StaticText(parent, label=algorithm.name)
+        self.label.Bind(wx.EVT_LEFT_UP, self._onclick)
         self.speeds = SpeedCtrl(parent)
-        self.speeds.set_values([0.0]*len(algorithm.algorithms))
+
+    def _onclick(self, event):
+        self.checkbox.SetValue(not self.checkbox.GetValue())
 
     def is_selected(self):
         return self.checkbox.GetValue()
@@ -248,28 +309,50 @@ class SpeedCtrl(wx.TextCtrl):
     def __init__(self, parent, *args, **kwargs):
         wx.StaticText.__init__(self, parent, *args,
                                style=wx.BORDER_NONE|wx.TE_CENTRE,
-                               size=(150, 20), **kwargs)
-        self._status_pos = 0
+                               size=(-1, 20), **kwargs)
+        self._StatusPos = 0
+        self.Bind(wx.EVT_KILL_FOCUS, self._OnUnfocus)
 
-    def set_values(self, values):
+    def SetValues(self, values):
         self.Enable()
         if all(speed == 0.0 for speed in values):
             s = '--'
         else:
             s = '; '.join(utils.format_speed(speed).strip() for speed in values)
-        self.SetValue(s)
+        self.ChangeValue(s)
 
-    def set_warmup(self, remaining):
+    def SetWarmup(self, remaining):
         self.Disable()
-        self.SetValue('warming up (%d)%s' % (remaining, self._status_dot()))
+        self.ChangeValue('warming up (%d)%s' % (remaining, self._StatusDot()))
 
-    def set_benchmark(self, values, remaining):
+    def SetBenchmark(self, values, remaining):
         self.Disable()
         s = '; '.join(utils.format_speed(speed).strip() for speed in values)
-        self.SetValue('%s (%d)%s' % (s, remaining, self._status_dot()))
+        self.ChangeValue('%s (%d)%s' % (s, remaining, self._StatusDot()))
 
-    def _status_dot(self):
-        s = ''.join('.' if i == self._status_pos else ' ' for i in range(3))
-        self._status_pos = (self._status_pos + 1) % 3
+    def _StatusDot(self):
+        s = ''.join('.' if i == self._StatusPos else ' ' for i in range(3))
+        self._StatusPos = (self._StatusPos + 1) % 3
         return s
+
+    def _OnUnfocus(self, event):
+        speeds = []
+        speedsRe = r' *[;,]? *(\d+\.?\d*) *([EePpTtGgMmkK](?:H|H/s)?|(?:H|H/s))'
+        for match in re.finditer(speedsRe, self.GetValue()):
+            factor = {
+                'E': 1e18,
+                'P': 1e15,
+                'T': 1e12,
+                'G': 1e9,
+                'M': 1e6,
+                'K': 1e3,
+                'H': 1
+                }
+            value = float(match[1])
+            unit = match[2][0].upper()
+            speeds.append(value*factor[unit])
+
+        event = InputSpeedsEvent(speeds=speeds, id=wx.ID_ANY)
+        event.SetEventObject(self)
+        wx.PostEvent(self, event)
 
